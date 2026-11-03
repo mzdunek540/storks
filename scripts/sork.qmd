@@ -1,0 +1,194 @@
+```{r}
+#| label: packages
+#| results: hide
+lib <- Sys.getenv("R_LIBS_USER")
+dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(lib, .libPaths()))
+install.packages(lib = lib, dependencies = TRUE)
+
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg))
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# List of packages needed to run our code. NOTE: tidyverse is loaded LAST, so its
+# functions (e.g. dplyr::select, dplyr::filter) win when two packages use the same name.
+packages <- c("knitr","rmarkdown","sf","terra","tidyterra","suntools","rnaturalearth",
+              "rnaturalearthdata","maptiles","tidyverse")
+
+# sf:                vector data (points, lines, polygons)
+# terra:             raster data
+# tidyterra:         plot and wrangle terra objects with ggplot2/tidyverse syntax
+# suntools:          sunrise, sunset, twilight and solar noon
+# rnaturalearth(data): open access spatial data from www.naturalearthdata.com
+# maptiles:          download map tiles and satellite imagery (optional step 4.5)
+# knitr, rmarkdown:  needed to render this .qmd file to an HTML report
+# tidyverse:         readr (reading data), dplyr & tidyr (wrangling), ggplot2 (plotting),
+#                    lubridate (dates and times), stringr (text)
+
+ipak(packages)
+```
+
+# Download data from Movebank using the move2 package
+
+```{r}
+#| label: move2
+#| eval: false
+library(move2)
+library(dplyr)
+library(sf)
+
+movebank_store_credentials("Zdvnio")
+
+lic <- "633902d4cf2f59910c2a9ae96e7d31b2"
+
+# reference data (one row per deployment)
+meta <- movebank_download_deployment(study_id = 7431347,
+                                     `license-md5` = lic)
+
+# GPS and Argos data together
+tracks <- movebank_download_study(study_id       = 7431347,
+                                  sensor_type_id = c("gps", "argos-doppler-shift"),
+                                  `license-md5`  = lic)
+
+tracks <- tracks %>%
+  filter(!st_is_empty(.)) %>%
+  mutate(long = st_coordinates(.)[, 1],
+         lat  = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry()
+
+count(tracks, sensor_type_id)
+
+```
+
+
+
+```{r}
+#| label: folders
+dir.out <- "./output"
+for(d in file.path(dir.out, c("maps","tables"))){
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+dir.create(file.path(dir.out, "maps", "per-individual"), showWarnings = FALSE)
+```
+
+
+## Clean and prepare
+
+```{r}
+#| label: prep
+# if you restart R, run this instead of downloading again:
+# tracks <- read_csv(file.path(dir.out, "tracks_raw.csv.gz"))
+
+data <- tracks %>%
+  transmute(ID     = as.character(individual_local_identifier),
+            dt     = as.POSIXct(timestamp, tz = "UTC"),
+            lat    = lat,
+            long   = long,
+            sensor = as.character(sensor_type_id)) %>%
+  filter(!is.na(lat), !is.na(long), !is.na(dt),
+         !(lat == 0 & long == 0)) %>%
+  distinct(ID, dt, .keep_all = TRUE)
+
+# OPTIONAL: GPS only (Argos is much less precise)
+# data <- data %>% filter(sensor == "gps")
+
+# Resample to 1 fix per hour (closest fix to each full hour), as in the tutorial
+data <- data %>%
+  mutate(dt_hr     = round_date(dt, "1 hour"),
+         dt_offset = abs(as.numeric(difftime(dt, dt_hr, units = "mins")))) %>%
+  group_by(ID, dt_hr) %>%
+  slice_min(dt_offset, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-dt_hr, -dt_offset) %>%
+  arrange(ID, dt) %>%
+  mutate(yr  = year(dt),
+         mth = factor(month(dt, label = TRUE, abbr = TRUE)))
+
+# overview: how many fixes per individual per year
+data %>% count(ID, yr) %>% pivot_wider(names_from = yr, values_from = n)
+```
+
+## Map 1: all individuals, one panel per year
+
+```{r}
+#| label: map-per-year
+#| fig-height: 8
+world <- ne_countries(scale = 50, returnclass = "sf")
+
+latlimits  <- c(min(data$lat)  - 0.5, max(data$lat)  + 0.5)
+longlimits <- c(min(data$long) - 0.5, max(data$long) + 0.5)
+
+map.year <- ggplot()+
+  geom_sf(data=world,fill='grey60',col='grey85',linewidth=.1)+
+  geom_path(data=data,aes(x=long,y=lat,col=ID,group=ID),linewidth=.2)+
+  geom_point(data=data,aes(x=long,y=lat,col=ID),size=.3,shape=16)+
+  scale_colour_viridis_d(option="turbo")+
+  coord_sf(xlim=longlimits,ylim=latlimits,expand=FALSE)+
+  theme_classic()+
+  theme(panel.background=element_rect(fill='grey85'))+
+  guides(col=guide_legend(override.aes=list(size=3,linewidth=1)))+
+  xlab("")+ylab("")+
+  facet_wrap(~yr, ncol = 3)
+
+map.year
+
+#ggsave(file.path(dir.out, "maps", "Map_tracks_per-year.png"), map.year,
+#       width = 30, height = 22, units = "cm", dpi = 300)
+```
+
+## Map 2: one patchwork per individual (one map per year)
+
+Each individual gets its own map extent. The same extent is used for all of its years, so the panels are directly comparable. Routes are coloured by month, so you can see timing within a year.
+
+```{r}
+#| label: map-per-individual
+# make one year-map for one individual
+map_one_year <- function(df, yr_i, xlim, ylim){
+  d <- filter(df, yr == yr_i)
+  ggplot()+
+    geom_sf(data=world,fill='grey60',col='grey85',linewidth=.1)+
+    geom_path(data=d,aes(x=long,y=lat,col=mth,group=1),linewidth=.3)+
+    geom_point(data=d,aes(x=long,y=lat,col=mth),size=.4,shape=16)+
+    scale_colour_viridis_d("Month",option="turbo",drop=FALSE)+
+    coord_sf(xlim=xlim,ylim=ylim,expand=FALSE)+
+    theme_classic()+
+    theme(panel.background=element_rect(fill='grey85'))+
+    guides(col=guide_legend(override.aes=list(size=3,linewidth=1)))+
+    ggtitle(yr_i)+xlab("")+ylab("")
+}
+
+# patchwork of all years for one individual
+map_individual <- function(df, id){
+  years <- sort(unique(df$yr))
+  padx  <- max(0.5, diff(range(df$long)) * 0.05)
+  pady  <- max(0.5, diff(range(df$lat))  * 0.05)
+  xlim  <- range(df$long) + c(-padx, padx)
+  ylim  <- range(df$lat)  + c(-pady, pady)
+
+  plots <- map(years, ~ map_one_year(df, .x, xlim, ylim))
+  ncols <- min(length(years), 3)
+
+  wrap_plots(plots, ncol = ncols, guides = "collect") +
+    plot_annotation(title = paste("Individual:", id)) &
+    theme(legend.position = "bottom")
+}
+
+# loop over all individuals: draw, and save as PNG
+by.id <- split(data, data$ID)
+
+for(id in names(by.id)){
+  p <- map_individual(by.id[[id]], id)
+  print(p)
+
+  n.years <- n_distinct(by.id[[id]]$yr)
+  ncols   <- min(n.years, 3)
+  nrows   <- ceiling(n.years / ncols)
+  fname   <- str_replace_all(id, "[^A-Za-z0-9_-]", "_")   # IDs may contain "/" etc.
+
+  ggsave(file.path(dir.out, "maps", "per-individual", paste0("Map_", fname, "_per-year.png")),
+         p, width = 9 * ncols, height = 8 * nrows, units = "cm", dpi = 300)
+}
+```
