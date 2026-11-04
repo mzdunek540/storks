@@ -74,28 +74,58 @@ for(d in file.path(dir.out, c("maps","tables"))){
 dir.create(file.path(dir.out, "maps", "per-individual"), showWarnings = FALSE)
 ```
 
+```{r}
+"deployment_id" %in% names(tracks)
+"deployment_id" %in% names(meta)
+class(tracks)
+```
+
 
 ## Clean and prepare
 
 ```{r}
-#| label: prep
-# if you restart R, run this instead of downloading again:
-# tracks <- read_csv(file.path(dir.out, "tracks_raw.csv.gz"))
+# helper: get a column as a vector, or NA if it doesn't exist
+getcol <- function(x, name) {
+  if (name %in% names(x)) x[[name]] else rep(NA, nrow(x))
+}
 
-data <- tracks %>%
-  transmute(ID     = as.character(individual_local_identifier),
-            dt     = as.POSIXct(timestamp, tz = "UTC"),
-            lat    = lat,
-            long   = long,
-            sensor = as.character(sensor_type_id)) %>%
+# 1. plain tibble from `tracks` (lat/long are already ordinary columns)
+tracks_df <- tibble(
+  deployment_id = as.character(tracks[["deployment_id"]]),
+  dt            = as.POSIXct(tracks[["timestamp"]], tz = "UTC"),
+  long          = as.numeric(tracks[["long"]]),
+  lat           = as.numeric(tracks[["lat"]]),
+  sensor        = as.character(getcol(tracks, "sensor_type_id")),
+  argos_lc      = as.character(getcol(tracks, "argos_lc")),
+  visible       = as.logical(getcol(tracks, "visible")),
+  man_out       = as.logical(getcol(tracks, "manually_marked_outlier")),
+  alg_out       = as.logical(getcol(tracks, "algorithm_marked_outlier"))
+)
+
+# 2. animal ID per deployment, from the reference data
+ids <- tibble(
+  deployment_id = as.character(meta[["deployment_id"]]),
+  ID            = as.character(getcol(meta, "individual_local_identifier"))
+) %>%
+  distinct(deployment_id, .keep_all = TRUE)
+
+# 3. join and clean
+data <- tracks_df %>%
+  left_join(ids, by = "deployment_id") %>%
+  mutate(ID = coalesce(ID, deployment_id)) %>%
   filter(!is.na(lat), !is.na(long), !is.na(dt),
-         !(lat == 0 & long == 0)) %>%
+         !(lat == 0 & long == 0),
+         visible %in% c(TRUE, NA),               # drop fixes hidden in Movebank
+         !(man_out %in% TRUE),                   # manually marked outliers
+         !(alg_out %in% TRUE),                   # algorithm-marked outliers
+         is.na(argos_lc) | argos_lc != "Z") %>%  # worst Argos class; GPS rows (NA) are kept
+  select(ID, dt, lat, long, sensor, argos_lc) %>%
   distinct(ID, dt, .keep_all = TRUE)
 
 # OPTIONAL: GPS only (Argos is much less precise)
 # data <- data %>% filter(sensor == "gps")
 
-# Resample to 1 fix per hour (closest fix to each full hour), as in the tutorial
+# 4. resample to 1 fix per hour (closest fix to each full hour)
 data <- data %>%
   mutate(dt_hr     = round_date(dt, "1 hour"),
          dt_offset = abs(as.numeric(difftime(dt, dt_hr, units = "mins")))) %>%
@@ -107,7 +137,10 @@ data <- data %>%
   mutate(yr  = year(dt),
          mth = factor(month(dt, label = TRUE, abbr = TRUE)))
 
-# overview: how many fixes per individual per year
+# checks
+nrow(tracks_df); nrow(data)
+sum(is.na(ids$ID))     # deployments without an animal ID in meta
+count(data, sensor)
 data %>% count(ID, yr) %>% pivot_wider(names_from = yr, values_from = n)
 ```
 
@@ -115,28 +148,36 @@ data %>% count(ID, yr) %>% pivot_wider(names_from = yr, values_from = n)
 
 ```{r}
 #| label: map-per-year
-#| fig-height: 8
+#| fig-width: 16
+#| fig-height: 16
 world <- ne_countries(scale = 50, returnclass = "sf")
 
-latlimits  <- c(min(data$lat)  - 0.5, max(data$lat)  + 0.5)
-longlimits <- c(min(data$long) - 0.5, max(data$long) + 0.5)
+latlimits  <- quantile(data$lat,  c(.005, .995)) + c(-1, 1)
+longlimits <- quantile(data$long, c(.005, .995)) + c(-1, 1)
+
+n.cols  <- 6
+n.years <- n_distinct(data$yr)
+n.rows  <- ceiling(n.years / n.cols)
 
 map.year <- ggplot()+
   geom_sf(data=world,fill='grey60',col='grey85',linewidth=.1)+
-  geom_path(data=data,aes(x=long,y=lat,col=ID,group=ID),linewidth=.2)+
-  geom_point(data=data,aes(x=long,y=lat,col=ID),size=.3,shape=16)+
+  geom_path(data=data,aes(x=long,y=lat,col=ID,group=ID),linewidth=.2,alpha=.7)+
   scale_colour_viridis_d(option="turbo")+
+  scale_x_continuous(breaks=seq(-40, 80, 40))+     # fewer x labels, so they don't overlap
+  scale_y_continuous(breaks=seq(-40, 80, 20))+
   coord_sf(xlim=longlimits,ylim=latlimits,expand=FALSE)+
   theme_classic()+
-  theme(panel.background=element_rect(fill='grey85'))+
-  guides(col=guide_legend(override.aes=list(size=3,linewidth=1)))+
+  theme(panel.background=element_rect(fill='grey85'),
+        legend.position="none",
+        strip.text=element_text(face="bold"),
+        axis.text=element_text(size=7))+
   xlab("")+ylab("")+
-  facet_wrap(~yr, ncol = 3)
+  facet_wrap(~yr, ncol = n.cols)
 
 map.year
 
 #ggsave(file.path(dir.out, "maps", "Map_tracks_per-year.png"), map.year,
-#       width = 30, height = 22, units = "cm", dpi = 300)
+ #      width = 36, height = 8 + 7 * n.rows, units = "cm", dpi = 300)
 ```
 
 ## Map 2: one patchwork per individual (one map per year)
@@ -156,7 +197,7 @@ map_one_year <- function(df, yr_i, xlim, ylim){
     coord_sf(xlim=xlim,ylim=ylim,expand=FALSE)+
     theme_classic()+
     theme(panel.background=element_rect(fill='grey85'))+
-    guides(col=guide_legend(override.aes=list(size=3,linewidth=1)))+
+    guides(col=guide_legend(override.aes=list(size=3,linewidth=1)))
     ggtitle(yr_i)+xlab("")+ylab("")
 }
 
@@ -188,7 +229,61 @@ for(id in names(by.id)){
   nrows   <- ceiling(n.years / ncols)
   fname   <- str_replace_all(id, "[^A-Za-z0-9_-]", "_")   # IDs may contain "/" etc.
 
-  ggsave(file.path(dir.out, "maps", "per-individual", paste0("Map_", fname, "_per-year.png")),
+ # ggsave(file.path(dir.out, "maps", "per-individual", paste0("Map_", fname, "_per-year.png")),
          p, width = 9 * ncols, height = 8 * nrows, units = "cm", dpi = 300)
+}
+```
+
+
+```{r}
+#| label: map-per-individual
+
+library(patchwork)
+
+map_one_year <- function(df, yr_i, xlim, ylim){
+  d <- filter(df, yr == yr_i)
+  ggplot() +
+    geom_sf(data = world, fill = "grey60", col = "grey85", linewidth = .1) +
+    geom_path(data = d, aes(x = long, y = lat, col = mth, group = 1), linewidth = .3) +
+    geom_point(data = d, aes(x = long, y = lat, col = mth), size = .4, shape = 16) +
+    scale_colour_viridis_d("Month", option = "turbo", drop = FALSE) +
+    coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+    theme_classic() +
+    theme(panel.background = element_rect(fill = "grey85")) +
+    guides(col = guide_legend(override.aes = list(size = 3, linewidth = 1))) +
+    ggtitle(yr_i) + xlab("") + ylab("")
+}
+
+map_individual <- function(df, id){
+  years <- sort(unique(df$yr))
+  padx  <- max(0.5, diff(range(df$long)) * 0.05)
+  pady  <- max(0.5, diff(range(df$lat))  * 0.05)
+  xlim  <- range(df$long) + c(-padx, padx)
+  ylim  <- range(df$lat)  + c(-pady, pady)
+
+  plots <- map(years, ~ map_one_year(df, .x, xlim, ylim))
+  ncols <- min(length(years), 3)
+
+  wrap_plots(plots, ncol = ncols, guides = "collect") +
+    plot_annotation(title = paste("Individual:", id)) &
+    theme(legend.position = "bottom")
+}
+
+by.id <- split(data, data$ID)
+
+# to test first, uncomment this to use only 3 individuals:
+# by.id <- by.id[1:3]
+
+for(id in names(by.id)){
+  p <- map_individual(by.id[[id]], id)
+
+  n.years <- n_distinct(by.id[[id]]$yr)
+  ncols   <- min(n.years, 3)
+  nrows   <- ceiling(n.years / ncols)
+  fname   <- str_replace_all(id, "[^A-Za-z0-9_-]", "_")
+
+  ggsave(file.path(dir.out, "maps", "per-individual", paste0("Map_", fname, "_per-year.png")),
+         p, width = 9 * ncols, height = 8 * nrows + 3, units = "cm", dpi = 200,
+         limitsize = FALSE)
 }
 ```
