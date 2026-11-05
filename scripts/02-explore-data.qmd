@@ -235,3 +235,187 @@ coverage |>
     n_fixes_retained  = sum(n_bins_with_fix)
   )
 ```
+# where did the birds start their journey?
+
+```{r}
+#| label: dataclear
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+library(dbscan)
+library(maps)          # world.cities, used to name clusters
+
+# ---- Settings ---------------------------------------------------------
+eps_km <- 50           # points closer than this are one tagging site/cluster
+
+# ---- 1. Tagging coordinates per deployment ----------------------------
+# Empty points become NA instead of failing
+xy_from_sfc <- function(x) {
+  empty <- st_is_empty(x)
+  out <- matrix(NA_real_, nrow = length(x), ncol = 2)
+  if (any(!empty)) out[!empty, ] <- st_coordinates(x[!empty])[, 1:2]
+  out
+}
+ok <- function(x, y) !is.na(x) & !is.na(y) & !(x == 0 & y == 0)
+
+on_xy  <- xy_from_sfc(meta$deploy_on_location)
+cap_xy <- xy_from_sfc(meta$capture_location)
+
+# ---- 2. Clean tracks --------------------------------------------------
+tracks_clean <- tracks |>
+  select(deployment_id, sensor_type_id, timestamp, long, lat,
+         argos_lc, ground_speed, heading,
+         algorithm_marked_outlier, manually_marked_outlier) |>
+  st_drop_geometry() |>
+  as_tibble() |>
+  filter(!is.na(long), !is.na(lat), !is.na(timestamp)) |>
+  filter(is.na(algorithm_marked_outlier) | !algorithm_marked_outlier) |>
+  filter(is.na(manually_marked_outlier)  | !manually_marked_outlier) |>
+  distinct(deployment_id, sensor_type_id, timestamp, .keep_all = TRUE) |>
+  arrange(deployment_id, timestamp) |>
+  mutate(sensor = if_else(sensor_type_id == 653, "gps", "argos")) |>
+  select(-algorithm_marked_outlier, -manually_marked_outlier)
+
+# First fix per deployment (fallback for the tagging location)
+first_fix <- tracks_clean |>
+  group_by(deployment_id) |>
+  slice(1) |>
+  ungroup() |>
+  select(deployment_id, fix_lon = long, fix_lat = lat)
+
+# ---- 3. Tagging site per deployment, with source ----------------------
+tag_sites <- tibble(
+  deployment_id = meta$deployment_id,
+  on_lon  = on_xy[, 1],  on_lat  = on_xy[, 2],
+  cap_lon = cap_xy[, 1], cap_lat = cap_xy[, 2]
+) |>
+  left_join(first_fix, by = "deployment_id") |>
+  mutate(
+    loc_source = case_when(
+      ok(on_lon,  on_lat)  ~ "deploy_on_location",
+      ok(cap_lon, cap_lat) ~ "capture_location",
+      ok(fix_lon, fix_lat) ~ "first_fix"
+    ),
+    tag_lon = case_when(loc_source == "deploy_on_location" ~ on_lon,
+                        loc_source == "capture_location"   ~ cap_lon,
+                        loc_source == "first_fix"          ~ fix_lon),
+    tag_lat = case_when(loc_source == "deploy_on_location" ~ on_lat,
+                        loc_source == "capture_location"   ~ cap_lat,
+                        loc_source == "first_fix"          ~ fix_lat)
+  ) |>
+  select(deployment_id, loc_source, tag_lon, tag_lat)
+
+count(tag_sites, loc_source)   # how many deployments use which source
+
+# ---- 4. Origin: country, or country - city if several clusters --------
+world <- ne_countries(scale = "medium", returnclass = "sf") |>
+  st_make_valid() |>
+  select(country = name_long)
+
+sites_sf <- tag_sites |>
+  filter(!is.na(tag_lon)) |>
+  st_as_sf(coords = c("tag_lon", "tag_lat"), crs = 4326, remove = FALSE)
+
+# Cluster tagging sites (great-circle distances, single-linkage DBSCAN)
+d  <- matrix(as.numeric(st_distance(sites_sf)), nrow = nrow(sites_sf))
+cl <- dbscan(as.dist(d), eps = eps_km * 1000, minPts = 1)$cluster
+
+clusters <- sites_sf |>
+  st_drop_geometry() |>
+  mutate(cluster = cl) |>
+  group_by(cluster) |>
+  summarise(n_deployments = n(),
+            clon = mean(tag_lon), clat = mean(tag_lat),
+            .groups = "drop")
+
+cent <- st_as_sf(clusters, coords = c("clon", "clat"), crs = 4326, remove = FALSE)
+
+# Country of each cluster centre
+clusters$country <- world$country[st_nearest_feature(cent, world)]
+
+# Nearest city (pop >= 10 000) to each cluster centre, used as the name
+cities <- maps::world.cities |>
+  filter(pop >= 10000) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+clusters$city <- cities$name[st_nearest_feature(cent, cities)]
+
+# One cluster in a country -> country; several -> "country - city"
+clusters <- clusters |>
+  group_by(country) |>
+  mutate(origin = if (n() == 1) country else paste0(country, " - ", city)) |>
+  ungroup() |>
+  mutate(origin = make.unique(origin, sep = " #"))
+
+clusters |> arrange(country, desc(n_deployments))   # inspect
+
+tag_sites <- tag_sites |>
+  left_join(
+    sites_sf |>
+      st_drop_geometry() |>
+      mutate(cluster = cl) |>
+      left_join(select(clusters, cluster, country, city, origin), by = "cluster") |>
+      select(deployment_id, cluster, country, city, origin),
+    by = "deployment_id"
+  )
+
+# ---- 5. Metadata ------------------------------------------------------
+meta_df <- meta |>
+  as_tibble() |>
+  select(deployment_id, tag_id, individual_id, ring_id, sex,
+         animal_life_stage, study_site,
+         deploy_on_timestamp, deploy_off_timestamp) |>
+  mutate(age_class = case_when(
+    animal_life_stage %in% c("juv", "juv (1st winter)") ~ "juvenile",
+    is.na(animal_life_stage)                            ~ "unknown",
+    TRUE ~ as.character(animal_life_stage)
+  )) |>
+  select(-animal_life_stage)
+
+# ---- 6. dataclear -----------------------------------------------------
+dataclear <- tracks_clean |>
+  inner_join(meta_df,  by = "deployment_id") |>
+  left_join(tag_sites, by = "deployment_id") |>
+  filter(is.na(deploy_on_timestamp) | timestamp >= deploy_on_timestamp) |>
+  arrange(individual_id, timestamp) |>
+  select(individual_id, tag_id, deployment_id, ring_id, sex, age_class,
+         origin, country, city, tag_lon, tag_lat, loc_source,
+         timestamp, long, lat, sensor, argos_lc, ground_speed, heading,
+         study_site, deploy_on_timestamp, deploy_off_timestamp)
+
+# How many rows did the cleaning remove?
+tibble(raw = nrow(tracks), after_cleaning = nrow(tracks_clean), dataclear = nrow(dataclear))
+
+dataclear |> distinct(deployment_id, origin) |> count(origin, sort = TRUE)
+```
+```{r}
+#| label: tagging-map
+#| fig-width: 9
+#| fig-height: 7
+pad <- 3
+bb  <- st_bbox(sites_sf)
+xl  <- c(bb["xmin"] - pad, bb["xmax"] + pad)
+yl  <- c(bb["ymin"] - pad, bb["ymax"] + pad)
+
+sites_df <- filter(tag_sites, !is.na(tag_lon))
+
+# Density of tagging locations
+ggplot() +
+  geom_sf(data = world, fill = "grey95", colour = "grey60", linewidth = 0.2) +
+  stat_density_2d_filled(
+    data = sites_df, aes(tag_lon, tag_lat, fill = after_stat(level)),
+    contour_var = "ndensity", alpha = 0.6
+  ) +
+  geom_count(data = sites_df, aes(tag_lon, tag_lat), shape = 21, fill = "white") +
+  scale_fill_viridis_d(name = "Relative density", direction = -1) +
+  scale_size_area(name = "Deployments") +
+  coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+  labs(x = NULL, y = NULL, title = "Where were the birds tagged?")
+
+# Same sites coloured by origin
+ggplot() +
+  geom_sf(data = world, fill = "grey95", colour = "grey60", linewidth = 0.2) +
+  geom_point(data = sites_df, aes(tag_lon, tag_lat, colour = origin),
+             size = 2.5, alpha = 0.8) +
+  coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+  labs(x = NULL, y = NULL, colour = "Origin")
+```

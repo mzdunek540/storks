@@ -1,0 +1,373 @@
+# 01 Setup your environment
+
+Run the common setup script and synchronize the local project with
+GitHub.
+
+```{r}
+# Run the setup script containing package restoration, helper functions, etc.
+source(here::here("scripts", "01-setup.R"))
+
+# Pull changes from the online repository into this local project folder.
+# This is especially important when collaborating on the same project.
+system2("git",c("-C", here::here(), "pull"))
+
+# authenticate your @student.rug.nl google account
+gsheets_auth()
+```
+```{r}
+#| label: packages
+#| results: hide
+lib <- Sys.getenv("R_LIBS_USER")
+dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(lib, .libPaths()))
+install.packages(lib = lib, dependencies = TRUE)
+
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg))
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# List of packages needed to run our code. NOTE: tidyverse is loaded LAST, so its
+# functions (e.g. dplyr::select, dplyr::filter) win when two packages use the same name.
+packages <- c("knitr","rmarkdown","sf","terra","tidyterra","suntools","rnaturalearth",
+              "rnaturalearthdata","maptiles","tidyverse")
+
+# sf:                vector data (points, lines, polygons)
+# terra:             raster data
+# tidyterra:         plot and wrangle terra objects with ggplot2/tidyverse syntax
+# suntools:          sunrise, sunset, twilight and solar noon
+# rnaturalearth(data): open access spatial data from www.naturalearthdata.com
+# maptiles:          download map tiles and satellite imagery (optional step 4.5)
+# knitr, rmarkdown:  needed to render this .qmd file to an HTML report
+# tidyverse:         readr (reading data), dplyr & tidyr (wrangling), ggplot2 (plotting),
+#                    lubridate (dates and times), stringr (text)
+
+ipak(packages)
+```
+
+# Download data from Movebank using the move2 package
+
+```{r}
+#| label: move2
+#| eval: false
+library(move2)
+library(dplyr)
+library(sf)
+
+movebank_store_credentials("Zdvnio") #bJd6wHDVZ@_NWVF
+
+lic <- "633902d4cf2f59910c2a9ae96e7d31b2"
+
+# reference data (one row per deployment)
+meta <- movebank_download_deployment(study_id = 7431347,
+                                     `license-md5` = lic)
+
+# GPS and Argos data together
+tracks <- movebank_download_study(study_id       = 7431347,
+                                  sensor_type_id = c("gps", "argos-doppler-shift"),
+                                  `license-md5`  = lic)
+
+tracks <- tracks %>%
+  filter(!st_is_empty(.)) %>%
+  mutate(long = st_coordinates(.)[, 1],
+         lat  = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry()
+
+count(tracks, sensor_type_id)
+
+```
+
+# Clean data
+
+```{r}
+#| label: subset-zerbst
+library(tidyverse)
+library(sf)
+library(dbscan)
+library(maps)
+
+eps_km <- 50   # clustering distance for tagging sites
+
+# ---- Keep untouched originals (so the chunk can be re-run) ------------
+if (!exists("meta_raw"))   meta_raw   <- meta
+if (!exists("tracks_raw")) tracks_raw <- tracks
+
+# ---- Tagging location per deployment ----------------------------------
+xy_from_sfc <- function(x) {
+  empty <- st_is_empty(x)
+  out <- matrix(NA_real_, nrow = length(x), ncol = 2)
+  if (any(!empty)) out[!empty, ] <- st_coordinates(x[!empty])[, 1:2]
+  out
+}
+ok <- function(x, y) !is.na(x) & !is.na(y) & !(x == 0 & y == 0)
+
+on_xy  <- xy_from_sfc(meta_raw$deploy_on_location)
+cap_xy <- xy_from_sfc(meta_raw$capture_location)
+
+# First fix per deployment (only a fallback for the tagging location)
+first_fix <- tracks_raw |>
+  select(deployment_id, sensor_type_id, timestamp, long, lat,
+         algorithm_marked_outlier, manually_marked_outlier) |>
+  st_drop_geometry() |>
+  as_tibble() |>
+  filter(!is.na(long), !is.na(lat), !is.na(timestamp)) |>
+  filter(is.na(algorithm_marked_outlier) | !algorithm_marked_outlier) |>
+  filter(is.na(manually_marked_outlier)  | !manually_marked_outlier) |>
+  distinct(deployment_id, sensor_type_id, timestamp, .keep_all = TRUE) |>
+  arrange(deployment_id, timestamp) |>
+  group_by(deployment_id) |>
+  slice(1) |>
+  ungroup() |>
+  select(deployment_id, fix_lon = long, fix_lat = lat)
+
+tag_sites <- tibble(
+  deployment_id = meta_raw$deployment_id,
+  on_lon  = on_xy[, 1],  on_lat  = on_xy[, 2],
+  cap_lon = cap_xy[, 1], cap_lat = cap_xy[, 2]
+) |>
+  left_join(first_fix, by = "deployment_id") |>
+  mutate(
+    loc_source = case_when(
+      ok(on_lon,  on_lat)  ~ "deploy_on_location",
+      ok(cap_lon, cap_lat) ~ "capture_location",
+      ok(fix_lon, fix_lat) ~ "first_fix"
+    ),
+    tag_lon = case_when(loc_source == "deploy_on_location" ~ on_lon,
+                        loc_source == "capture_location"   ~ cap_lon,
+                        loc_source == "first_fix"          ~ fix_lon),
+    tag_lat = case_when(loc_source == "deploy_on_location" ~ on_lat,
+                        loc_source == "capture_location"   ~ cap_lat,
+                        loc_source == "first_fix"          ~ fix_lat)
+  ) |>
+  select(deployment_id, loc_source, tag_lon, tag_lat)
+
+# ---- Cluster tagging sites and find the Zerbst cluster -----------------
+sites_sf <- tag_sites |>
+  filter(!is.na(tag_lon)) |>
+  st_as_sf(coords = c("tag_lon", "tag_lat"), crs = 4326, remove = FALSE)
+
+d  <- matrix(as.numeric(st_distance(sites_sf)), nrow = nrow(sites_sf))
+cl <- dbscan(as.dist(d), eps = eps_km * 1000, minPts = 1)$cluster
+
+clusters <- sites_sf |>
+  st_drop_geometry() |>
+  mutate(cluster = cl) |>
+  group_by(cluster) |>
+  summarise(n_deployments = n(),
+            clon = mean(tag_lon), clat = mean(tag_lat),
+            .groups = "drop")
+
+cent <- st_as_sf(clusters, coords = c("clon", "clat"), crs = 4326, remove = FALSE)
+
+cities <- maps::world.cities |>
+  filter(pop >= 10000) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+nearest          <- st_nearest_feature(cent, cities)
+clusters$city    <- cities$name[nearest]
+clusters$country <- cities$country.etc[nearest]
+
+zerbst_cluster <- clusters |>
+  filter(city == "Zerbst", country == "Germany") |>
+  pull(cluster)
+stopifnot(length(zerbst_cluster) == 1)
+
+zerbst_deployments <- sites_sf |>
+  st_drop_geometry() |>
+  mutate(cluster = cl) |>
+  filter(cluster == zerbst_cluster) |>
+  pull(deployment_id)
+
+# ---- Exclude individuals with "relocated" in manipulation_type --------
+# (all deployments of such an individual are removed)
+relocated_individuals <- meta_raw |>
+  filter(deployment_id %in% zerbst_deployments,
+         str_detect(as.character(manipulation_type), "relocated") %in% TRUE) |>
+  pull(individual_id) |>
+  unique()
+
+keep_deployments <- meta_raw |>
+  filter(deployment_id %in% zerbst_deployments,
+         !individual_id %in% relocated_individuals) |>
+  pull(deployment_id)
+
+# ---- Create final meta and tracks -------------------------------------
+meta   <- meta_raw   |> filter(deployment_id %in% keep_deployments)
+tracks <- tracks_raw |> filter(deployment_id %in% keep_deployments)
+
+# Check
+tibble(
+  zerbst_deployments        = length(zerbst_deployments),
+  relocated_individuals_out = length(relocated_individuals),
+  deployments_meta          = n_distinct(meta$deployment_id),
+  individuals_meta          = n_distinct(meta$individual_id),
+  deployments_tracks        = n_distinct(tracks$deployment_id),
+  rows_tracks               = nrow(tracks)
+)
+
+count(st_drop_geometry(meta), manipulation_type)   # "relocated" should be gone
+```
+## STEP 1.4: Combine metadata and tracking data
+
+We join the bird information to every GPS fix, matching on the deployment. `left_join()` keeps all rows of `tracks`.
+
+```{r}
+#| label: join
+library(tidyverse)
+library(sf)
+
+# One row per deployment, with the names used in the rest of the template
+birds <- meta %>%
+  as_tibble() %>%
+  select(deployment_id,
+         ID  = individual_id,
+         dev = tag_id,
+         age = animal_life_stage)
+
+# Each deployment must appear only once, otherwise the join duplicates fixes
+birds %>% count(deployment_id) %>% filter(n > 1)   # should be empty
+
+data <- tracks %>% left_join(birds, by = "deployment_id")
+
+nrow(tracks) == nrow(data)  # same number of rows as before: the join did not duplicate fixes
+
+```
+# PART 2: Cleaning tracking data
+
+```{r}
+#| label: filter-log
+filter.log <- tibble(step = "raw data", n.fixes = nrow(data))
+
+# Log of how many fixes remain after each filtering step
+log_step <- function(log, step, df){
+  add_row(log, step = step, n.fixes = nrow(df))
+}
+```
+
+## STEP 2.1: Remove absent fixes
+
+
+```{r}
+#| label: filter-absent
+data <- data %>%
+  filter(!is.na(lat), !is.na(long),
+         !(lat == 0 & long == 0),
+         between(lat, -90, 90), between(long, -180, 180))
+
+# The data is an sf object: drop fixes whose geometry is empty
+if (inherits(data, "sf")) data <- data[!st_is_empty(data), ]
+
+filter.log <- log_step(filter.log, "absent coordinates", data)
+filter.log
+```
+```{r}
+#| label: join
+birds <- meta %>%
+  as_tibble() %>%
+  select(deployment_id,
+         ID            = individual_id,
+         dev           = tag_id,
+         age           = animal_life_stage,
+         session_start = deploy_on_timestamp,
+         session_end   = deploy_off_timestamp)
+
+data <- tracks %>%
+  left_join(birds, by = "deployment_id") %>%
+  mutate(dt = timestamp)   # the rest of the template uses dt
+```
+## STEP 2.2: Remove fixes outside the deployment
+
+Tags often record positions before they are put on a bird and sometimes after the bird died or lost its tag. The deployment start and end in the metadata tell us which fixes belong to the bird.
+
+```{r}
+#| label: filter-deployment
+# summary(birds$session_start)   # check for NAs first
+data %>%
+  st_drop_geometry() %>%
+  filter((!is.na(session_start) & dt < session_start) |
+         (!is.na(session_end)   & dt > session_end)) %>%
+  count(ID, name = "fixes.outside.deployment")
+
+# Missing start or end dates are not treated as a reason to remove a fix
+data <- data %>%
+  filter(is.na(session_start) | dt >= session_start,
+         is.na(session_end)   | dt <= session_end)
+
+filter.log <- log_step(filter.log, "outside deployment", data)
+```
+
+## STEP 2.3: Remove outliers flagged in Movebank, and duplicates
+
+Data owners can mark outliers in Movebank. We also remove duplicated fixes: rows of the same bird with the same timestamp. If a GPS and an Argos fix share a timestamp, the GPS fix (sensor 653) is kept.
+
+```{r}
+#| label: filter-outliers-duplicates
+data %>% st_drop_geometry() %>%
+  count(algorithm_marked_outlier, manually_marked_outlier)
+
+data <- data %>%
+  filter(!(algorithm_marked_outlier %in% TRUE),
+         !(manually_marked_outlier  %in% TRUE))
+filter.log <- log_step(filter.log, "marked as outlier in Movebank", data)
+
+sum(duplicated(st_drop_geometry(data)[, c("ID", "dt")]))
+
+data <- data %>%
+  arrange(ID, dt, sensor_type_id) %>%
+  distinct(ID, dt, .keep_all = TRUE)
+filter.log <- log_step(filter.log, "duplicated timestamps", data)
+```
+
+## STEP 2.4: Remove poor-quality fixes
+
+Our tags are Argos transmitters. Fixes from the GPS sensor have no quality fields here (`argos_lc` is `NA`) and are kept. Argos fixes get a location class: 3, 2, 1 and 0 have estimated errors from under 250 m to over 1500 m, A and B have no error estimate, and Z means the location is invalid.
+
+```{r}
+#| label: argos-quality
+#| fig-height: 3
+data %>%
+  st_drop_geometry() %>%
+  mutate(lc = replace_na(as.character(argos_lc), "GPS (no class)")) %>%
+  ggplot() +
+  geom_bar(aes(x = lc)) +
+  xlab("Argos location class") +
+  theme_classic()
+
+table(data$argos_lc, useNA = "ifany")
+```
+
+We remove the classes B and Z. Change `lc_keep` if you want to be stricter or more lenient.
+
+```{r}
+#| label: filter-quality
+lc_keep <- c("3", "2", "1", "0", "A")
+
+data <- data %>%
+  filter(is.na(argos_lc) | as.character(argos_lc) %in% lc_keep)
+filter.log <- log_step(filter.log, "Argos location class B or Z", data)
+```
+
+## STEP 2.5: Flag implausible altitudes
+
+Altitude is much less precise than position, so rather than throwing away good positions because of a bad altitude, we set implausible altitudes to `NA`. Storks soar in thermals and cross high ground on migration, so I allow a wide range of -100 to 5000 m. `height_raw` (GPS) is stored as text, so it is converted to numbers first. It is a height above the ellipsoid, not above sea level, so it can differ from true altitude by a few tens of metres.
+
+```{r}
+#| label: filter-altitude
+alt_min <- -100
+alt_max <- 5000
+
+summary(as.numeric(as.character(data$height_raw)))
+summary(data$argos_altitude)
+
+data <- data %>%
+  mutate(
+    alt_gps   = suppressWarnings(as.numeric(as.character(height_raw))),
+    alt_gps   = if_else(alt_gps < alt_min | alt_gps > alt_max, NA_real_, alt_gps),
+    alt_argos = if_else(argos_altitude < alt_min | argos_altitude > alt_max,
+                        NA_real_, argos_altitude)
+  )
+
+colSums(is.na(st_drop_geometry(data)[, c("alt_gps", "alt_argos")]))
+```
