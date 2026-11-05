@@ -1,3 +1,531 @@
+# Zosioskrypt
+
+---
+title: "04-organizing and importing data"
+author: "Thomas Lameris"
+date: "2025-8-22"
+format: html
+editor: 
+  markdown: 
+    wrap: 72
+editor_options: 
+  chunk_output_type: console
+execute:
+  output: false
+  warning: false
+  message: false
+---
+
+How to import data into R from different sources, including local files and online databases.
+You will learn to not use local data files, but instead read the data from an online Google Sheets database
+
+# 01 Setup your environment
+
+Run the common setup script and synchronize the local project with
+GitHub.
+
+```{r}
+# Run the setup script containing package restoration, helper functions, etc.
+source(here::here("scripts", "01-setup.R"))
+
+# Pull changes from the online repository into this local project folder.
+# This is especially important when collaborating on the same project.
+system2("git",c("-C", here::here(), "pull"))
+
+# authenticate your @student.rug.nl google account
+gsheets_auth()
+```
+
+
+# 02 Method 3 - read data from  online databases
+
+This is the highly recommended choice of these three methods.
+This means that there is only one version of
+the data, and all collaborators read the same data. This is therefore
+preferred method for collaborative projects, especially when the data change
+ over time. The all team members always work with the up-to-date data.
+
+# Answering questions:
+1.  How many individuals, tags and deployments are there, and over which period? Which age classes?
+2.  What is the sampling schedule (intervals between fixes)? Does it change over time or between tags? To which interval will you resample?
+3.  Which quality information is available (satellites, HDOP, Movebank outlier flags), and how many fixes does each filter remove?
+4.  Which speed threshold is realistic for your species?
+5.  Which environmental data do you need, at which resolution, and in which projection?
+
+```{r} 
+#1
+#| label: data-overview
+library(tidyverse)
+library(sf)
+
+# Drop geometry for faster summaries
+tracks_df <- st_drop_geometry(tracks)
+meta_df   <- st_drop_geometry(meta)
+
+# Deployments that actually have location data
+meta_used <- meta_df |>
+  semi_join(tracks_df, by = "deployment_id")
+
+# 1. Individuals, tags and deployments
+n_overview <- tibble(
+  n_individuals = n_distinct(meta_used$individual_id),
+  n_tags        = n_distinct(meta_used$tag_id),
+  n_deployments = n_distinct(meta_used$deployment_id)
+)
+n_overview
+
+# Same counts for the full metadata (incl. deployments without tracks)
+meta_df |>
+  summarise(
+    n_individuals = n_distinct(individual_id),
+    n_tags        = n_distinct(tag_id),
+    n_deployments = n_distinct(deployment_id)
+  )
+
+# 2. Period covered
+# a) by the tracking data
+tracks_df |>
+  summarise(
+    first_fix  = min(timestamp, na.rm = TRUE),
+    last_fix   = max(timestamp, na.rm = TRUE),
+    span_years = as.numeric(difftime(last_fix, first_fix, units = "days")) / 365.25
+  )
+
+# b) by the deployment on/off dates
+meta_used |>
+  summarise(
+    first_deploy_on = min(deploy_on_timestamp, na.rm = TRUE),
+    last_deploy_on  = max(deploy_on_timestamp, na.rm = TRUE),
+    last_deploy_off = max(deploy_off_timestamp, na.rm = TRUE)
+  )
+
+# Number of deployments per year (start year)
+meta_used |>
+  count(year = year(deploy_on_timestamp), name = "n_deployments") |>
+  print(n = Inf)
+
+# 3. Age classes
+age_classes <- meta_used |>
+  mutate(animal_life_stage = fct_na_value_to_level(animal_life_stage, "unknown")) |>
+  group_by(animal_life_stage) |>
+  summarise(
+    n_individuals = n_distinct(individual_id),
+    n_deployments = n_distinct(deployment_id),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_deployments))
+age_classes
+```
+```{r}
+#| label: sampling-schedule
+library(tidyverse)
+library(sf)
+
+tracks_df <- st_drop_geometry(tracks)
+meta_df   <- st_drop_geometry(meta)
+
+# Fix intervals within deployment and sensor type
+fixes <- tracks_df |>
+  select(deployment_id, sensor_type_id, timestamp) |>
+  distinct() |>                                   # drop duplicated fixes
+  left_join(
+    meta_df |> select(deployment_id, tag_id, individual_id, animal_life_stage),
+    by = "deployment_id"
+  ) |>
+  arrange(deployment_id, sensor_type_id, timestamp) |>
+  group_by(deployment_id, sensor_type_id) |>
+  mutate(dt_h = as.numeric(difftime(timestamp, lag(timestamp), units = "hours"))) |>
+  ungroup() |>
+  mutate(year = year(timestamp))
+
+# Which sensors are present?
+count(fixes, sensor_type_id)
+
+# 1. Overall distribution of intervals (hours)
+fixes |>
+  filter(!is.na(dt_h)) |>
+  group_by(sensor_type_id) |>
+  summarise(
+    n      = n(),
+    p05    = quantile(dt_h, 0.05),
+    q25    = quantile(dt_h, 0.25),
+    median = median(dt_h),
+    q75    = quantile(dt_h, 0.75),
+    p95    = quantile(dt_h, 0.95),
+    max    = max(dt_h)
+  )
+
+fixes |>
+  filter(!is.na(dt_h), dt_h > 0) |>
+  ggplot(aes(dt_h)) +
+  geom_histogram(bins = 80) +
+  scale_x_log10(
+    breaks = c(1/60, 0.25, 1, 3, 6, 12, 24, 72, 240),
+    labels = c("1 min", "15 min", "1 h", "3 h", "6 h", "12 h", "1 d", "3 d", "10 d")
+  ) +
+  facet_wrap(~ sensor_type_id, scales = "free_y") +
+  labs(x = "Interval between consecutive fixes", y = "Count")
+
+# 2. Change over time: median interval and fixes per day, by year
+fixes |>
+  filter(!is.na(dt_h)) |>
+  group_by(sensor_type_id, year) |>
+  summarise(
+    n_fixes     = n(),
+    n_tags      = n_distinct(tag_id),
+    median_dt_h = median(dt_h),
+    q75_dt_h    = quantile(dt_h, 0.75),
+    .groups = "drop"
+  ) |>
+  print(n = Inf)
+
+fixes |>
+  filter(!is.na(dt_h), dt_h > 0) |>
+  ggplot(aes(factor(year), dt_h)) +
+  geom_boxplot(outlier.size = 0.3) +
+  scale_y_log10() +
+  facet_wrap(~ sensor_type_id, ncol = 1) +
+  labs(x = "Year", y = "Interval (h, log scale)") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+# 3. Between tags / deployments
+per_deployment <- fixes |>
+  filter(!is.na(dt_h)) |>
+  group_by(deployment_id, tag_id, individual_id, animal_life_stage, sensor_type_id) |>
+  summarise(
+    start       = min(timestamp),
+    end         = max(timestamp),
+    n_fixes     = n() + 1,
+    median_dt_h = median(dt_h),
+    q75_dt_h    = quantile(dt_h, 0.75),
+    fixes_per_day = n_fixes / as.numeric(difftime(end, start, units = "days")),
+    .groups = "drop"
+  )
+
+per_deployment |>
+  ggplot(aes(start, median_dt_h, colour = factor(sensor_type_id))) +
+  geom_point(alpha = 0.6) +
+  scale_y_log10() +
+  labs(x = "Deployment start", y = "Median interval (h)", colour = "Sensor")
+
+summary(per_deployment$median_dt_h)
+
+# 4. Which resampling interval? Test a few candidates.
+# For each deployment and candidate interval: the share of time bins
+# (between first and last fix) that contain at least one fix.
+candidates_h <- c(1, 2, 3, 4, 6, 12, 24)
+
+coverage <- map_dfr(candidates_h, function(h) {
+  fixes |>
+    group_by(deployment_id) |>
+    mutate(bin = floor_date(timestamp, unit = paste(h, "hours"))) |>
+    summarise(
+      n_bins_total = as.numeric(difftime(max(bin), min(bin), units = "hours")) / h + 1,
+      n_bins_with_fix = n_distinct(bin),
+      .groups = "drop"
+    ) |>
+    mutate(interval_h = h, coverage = n_bins_with_fix / n_bins_total)
+})
+
+coverage |>
+  group_by(interval_h) |>
+  summarise(
+    median_coverage   = median(coverage),
+    deployments_ge_80 = sum(coverage >= 0.8),
+    deployments_ge_50 = sum(coverage >= 0.5),
+    n_deployments     = n(),
+    n_fixes_retained  = sum(n_bins_with_fix)
+  )
+```
+
+# where did the birds start their journey?
+
+```{r}
+#| label: dataclear
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+library(dbscan)
+library(maps)          # world.cities, used to name clusters
+
+# ---- Settings ---------------------------------------------------------
+eps_km <- 50           # points closer than this are one tagging site/cluster
+
+# ---- 1. Tagging coordinates per deployment ----------------------------
+# Empty points become NA instead of failing
+xy_from_sfc <- function(x) {
+  empty <- st_is_empty(x)
+  out <- matrix(NA_real_, nrow = length(x), ncol = 2)
+  if (any(!empty)) out[!empty, ] <- st_coordinates(x[!empty])[, 1:2]
+  out
+}
+ok <- function(x, y) !is.na(x) & !is.na(y) & !(x == 0 & y == 0)
+
+on_xy  <- xy_from_sfc(meta$deploy_on_location)
+cap_xy <- xy_from_sfc(meta$capture_location)
+
+# ---- 2. Clean tracks --------------------------------------------------
+tracks_clean <- tracks |>
+  select(deployment_id, sensor_type_id, timestamp, long, lat,
+         argos_lc, ground_speed, heading,
+         algorithm_marked_outlier, manually_marked_outlier) |>
+  st_drop_geometry() |>
+  as_tibble() |>
+  filter(!is.na(long), !is.na(lat), !is.na(timestamp)) |>
+  filter(is.na(algorithm_marked_outlier) | !algorithm_marked_outlier) |>
+  filter(is.na(manually_marked_outlier)  | !manually_marked_outlier) |>
+  distinct(deployment_id, sensor_type_id, timestamp, .keep_all = TRUE) |>
+  arrange(deployment_id, timestamp) |>
+  mutate(sensor = if_else(sensor_type_id == 653, "gps", "argos")) |>
+  select(-algorithm_marked_outlier, -manually_marked_outlier)
+
+# First fix per deployment (fallback for the tagging location)
+first_fix <- tracks_clean |>
+  group_by(deployment_id) |>
+  slice(1) |>
+  ungroup() |>
+  select(deployment_id, fix_lon = long, fix_lat = lat)
+
+# ---- 3. Tagging site per deployment, with source ----------------------
+tag_sites <- tibble(
+  deployment_id = meta$deployment_id,
+  on_lon  = on_xy[, 1],  on_lat  = on_xy[, 2],
+  cap_lon = cap_xy[, 1], cap_lat = cap_xy[, 2]
+) |>
+  left_join(first_fix, by = "deployment_id") |>
+  mutate(
+    loc_source = case_when(
+      ok(on_lon,  on_lat)  ~ "deploy_on_location",
+      ok(cap_lon, cap_lat) ~ "capture_location",
+      ok(fix_lon, fix_lat) ~ "first_fix"
+    ),
+    tag_lon = case_when(loc_source == "deploy_on_location" ~ on_lon,
+                        loc_source == "capture_location"   ~ cap_lon,
+                        loc_source == "first_fix"          ~ fix_lon),
+    tag_lat = case_when(loc_source == "deploy_on_location" ~ on_lat,
+                        loc_source == "capture_location"   ~ cap_lat,
+                        loc_source == "first_fix"          ~ fix_lat)
+  ) |>
+  select(deployment_id, loc_source, tag_lon, tag_lat)
+
+count(tag_sites, loc_source)   # how many deployments use which source
+
+# ---- 4. Origin: country, or country - city if several clusters --------
+world <- ne_countries(scale = "medium", returnclass = "sf") |>
+  st_make_valid() |>
+  select(country = name_long)
+
+sites_sf <- tag_sites |>
+  filter(!is.na(tag_lon)) |>
+  st_as_sf(coords = c("tag_lon", "tag_lat"), crs = 4326, remove = FALSE)
+
+# Cluster tagging sites (great-circle distances, single-linkage DBSCAN)
+d  <- matrix(as.numeric(st_distance(sites_sf)), nrow = nrow(sites_sf))
+cl <- dbscan(as.dist(d), eps = eps_km * 1000, minPts = 1)$cluster
+
+clusters <- sites_sf |>
+  st_drop_geometry() |>
+  mutate(cluster = cl) |>
+  group_by(cluster) |>
+  summarise(n_deployments = n(),
+            clon = mean(tag_lon), clat = mean(tag_lat),
+            .groups = "drop")
+
+cent <- st_as_sf(clusters, coords = c("clon", "clat"), crs = 4326, remove = FALSE)
+
+# Country of each cluster centre
+clusters$country <- world$country[st_nearest_feature(cent, world)]
+
+# Nearest city (pop >= 10 000) to each cluster centre, used as the name
+cities <- maps::world.cities |>
+  filter(pop >= 10000) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+clusters$city <- cities$name[st_nearest_feature(cent, cities)]
+
+# One cluster in a country -> country; several -> "country - city"
+clusters <- clusters |>
+  group_by(country) |>
+  mutate(origin = if (n() == 1) country else paste0(country, " - ", city)) |>
+  ungroup() |>
+  mutate(origin = make.unique(origin, sep = " #"))
+
+clusters |> arrange(country, desc(n_deployments))   # inspect
+
+tag_sites <- tag_sites |>
+  left_join(
+    sites_sf |>
+      st_drop_geometry() |>
+      mutate(cluster = cl) |>
+      left_join(select(clusters, cluster, country, city, origin), by = "cluster") |>
+      select(deployment_id, cluster, country, city, origin),
+    by = "deployment_id"
+  )
+
+# ---- 5. Metadata ------------------------------------------------------
+meta_df <- meta |>
+  as_tibble() |>
+  select(deployment_id, tag_id, individual_id, ring_id, sex,
+         animal_life_stage, study_site,
+         deploy_on_timestamp, deploy_off_timestamp) |>
+  mutate(age_class = case_when(
+    animal_life_stage %in% c("juv", "juv (1st winter)") ~ "juvenile",
+    is.na(animal_life_stage)                            ~ "unknown",
+    TRUE ~ as.character(animal_life_stage)
+  )) |>
+  select(-animal_life_stage)
+
+# ---- 6. dataclear -----------------------------------------------------
+dataclear <- tracks_clean |>
+  inner_join(meta_df,  by = "deployment_id") |>
+  left_join(tag_sites, by = "deployment_id") |>
+  filter(is.na(deploy_on_timestamp) | timestamp >= deploy_on_timestamp) |>
+  arrange(individual_id, timestamp) |>
+  select(individual_id, tag_id, deployment_id, ring_id, sex, age_class,
+         origin, country, city, tag_lon, tag_lat, loc_source,
+         timestamp, long, lat, sensor, argos_lc, ground_speed, heading,
+         study_site, deploy_on_timestamp, deploy_off_timestamp)
+
+# How many rows did the cleaning remove?
+tibble(raw = nrow(tracks), after_cleaning = nrow(tracks_clean), dataclear = nrow(dataclear))
+
+dataclear |> distinct(deployment_id, origin) |> count(origin, sort = TRUE)
+```
+```{r}
+#| label: tagging-map
+#| fig-width: 9
+#| fig-height: 7
+pad <- 3
+bb  <- st_bbox(sites_sf)
+xl  <- c(bb["xmin"] - pad, bb["xmax"] + pad)
+yl  <- c(bb["ymin"] - pad, bb["ymax"] + pad)
+
+sites_df <- filter(tag_sites, !is.na(tag_lon))
+
+# Density of tagging locations
+ggplot() +
+  geom_sf(data = world, fill = "grey95", colour = "grey60", linewidth = 0.2) +
+  stat_density_2d_filled(
+    data = sites_df, aes(tag_lon, tag_lat, fill = after_stat(level)),
+    contour_var = "ndensity", alpha = 0.6
+  ) +
+  geom_count(data = sites_df, aes(tag_lon, tag_lat), shape = 21, fill = "white") +
+  scale_fill_viridis_d(name = "Relative density", direction = -1) +
+  scale_size_area(name = "Deployments") +
+  coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+  labs(x = NULL, y = NULL, title = "Where were the birds tagged?")
+
+# Same sites coloured by origin
+ggplot() +
+  geom_sf(data = world, fill = "grey95", colour = "grey60", linewidth = 0.2) +
+  geom_point(data = sites_df, aes(tag_lon, tag_lat, colour = origin),
+             size = 2.5, alpha = 0.8) +
+  coord_sf(xlim = xl, ylim = yl, expand = FALSE) +
+  labs(x = NULL, y = NULL, colour = "Origin")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ```{r}
 #| label: packages
 #| results: hide
