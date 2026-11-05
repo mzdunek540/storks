@@ -1,0 +1,397 @@
+# Part 2: migration start/end, distance, duration, route counts
+
+This part continues from `data.route` (hourly fixes, with `ID_clean`, `route`, `yr`, `dt`, `lat`, `long`).
+Everything below is **autumn migration** (breeding area -> wintering area). Tweak the parameters in the first chunk and re-run.
+
+```{r}
+#| label: extra-packages
+#| results: hide
+ipak(c("patchwork", "lme4", "lmerTest", "geodata"))
+```
+
+## 1. Helpers, parameters and a speed filter
+
+The straight lines crossing the Sahara/Mediterranean in your maps are almost certainly gaps or bad Argos fixes. They would inflate every distance, so I remove fixes that imply an impossible speed.
+
+```{r}
+#| label: helpers
+
+# ---- parameters you may want to tweak --------------------------------------
+V_MAX        <- 120   # km/h, faster steps are treated as location errors
+R_DEPART     <- 100   # km from summer site: inside = "still at the breeding area"
+R_ARRIVE     <- 250   # km from winter site: inside = "arrived at wintering area"
+MIN_DIST     <- 500   # km, bird must get at least this far from the summer site to count as migrant
+MIN_FIX      <- 20    # minimum fixes needed to define a summer / winter site
+AUT_START    <- "08-01"   # autumn window start (month-day)
+SUMMER_START <- "06-01"; SUMMER_END <- "07-15"
+WINTER_START <- "12-15"; WINTER_END <- "02-15"   # ends in the following year
+# -----------------------------------------------------------------------------
+
+# great-circle distance in km (haversine), vectorised
+hav_km <- function(lon1, lat1, lon2, lat2){
+  r <- 6371.0088; k <- pi / 180
+  a <- sin((lat2 - lat1) * k / 2)^2 +
+       cos(lat1 * k) * cos(lat2 * k) * sin((lon2 - lon1) * k / 2)^2
+  2 * r * asin(pmin(1, sqrt(a)))
+}
+
+# add step length (km), time between fixes (h) and speed (km/h), per individual
+add_steps <- function(df){
+  df %>%
+    group_by(ID_clean) %>%
+    arrange(dt, .by_group = TRUE) %>%
+    mutate(step_km = hav_km(lag(long), lag(lat), long, lat),
+           step_h  = as.numeric(difftime(dt, lag(dt), units = "hours")),
+           speed   = step_km / step_h) %>%
+    ungroup()
+}
+
+# drop fixes with impossible incoming speed; repeat because removing one fix changes the next step
+remove_speed_outliers <- function(df, vmax = V_MAX, max_iter = 10){
+  for(i in seq_len(max_iter)){
+    df  <- add_steps(df)
+    bad <- which(df$speed > vmax)
+    if(length(bad) == 0) break
+    df  <- df[-bad, ]
+  }
+  add_steps(df)
+}
+
+n_before <- nrow(data.route)
+trk <- remove_speed_outliers(data.route)
+n_before - nrow(trk)     # number of fixes removed
+```
+
+## 2. Start and end of autumn migration (per individual and year)
+
+Logic, so you can defend it in the methods:
+
+* **Summer site** = median position 1 Jun - 15 Jul of that year (nestlings and breeders sit at the nest then).
+* **Winter site** = median position 15 Dec - 15 Feb (birds are settled, or at least much less mobile).
+* **Departure** = last fix inside `R_DEPART` km of the summer site after 1 Aug (the bird does not return afterwards).
+* **Arrival** = first fix after departure within `R_ARRIVE` km of the winter site.
+* Birds that never get further than `MIN_DIST` km from the summer site are labelled `resident` (this matters for migratory *tactics*: West-route birds that stay in Iberia/Morocco will land here).
+
+```{r}
+#| label: migration-events
+mig_one <- function(d, y){
+  fail <- function(msg) tibble(yr = y, status = msg)
+  mk   <- function(md, yy = y) ymd(paste0(yy, "-", md), tz = "UTC")
+
+  summer <- filter(d, dt >= mk(SUMMER_START), dt <= mk(SUMMER_END) + days(1))
+  winter <- filter(d, dt >= mk(WINTER_START), dt <= mk(WINTER_END, y + 1) + days(1))
+  if(nrow(summer) < MIN_FIX) return(fail("no summer fixes"))
+  if(nrow(winter) < MIN_FIX) return(fail("no winter fixes"))
+
+  s_lon <- median(summer$long); s_lat <- median(summer$lat)
+  w_lon <- median(winter$long); w_lat <- median(winter$lat)
+
+  aut <- d %>%
+    filter(dt >= mk(AUT_START), dt < mk("01-01", y + 1)) %>%
+    mutate(d_sum = hav_km(s_lon, s_lat, long, lat))
+  if(nrow(aut) == 0)                return(fail("no autumn fixes"))
+  if(max(aut$d_sum) < MIN_DIST)     return(fail("resident"))
+
+  in_idx <- which(aut$d_sum <= R_DEPART)
+  if(length(in_idx) == 0)           return(fail("no fixes at summer site in autumn"))
+  dep <- aut[max(in_idx), ]
+
+  post <- d %>%
+    filter(dt >= dep$dt) %>%
+    mutate(d_win = hav_km(w_lon, w_lat, long, lat))
+  arr_i <- which(post$d_win <= R_ARRIVE)
+  if(length(arr_i) == 0)            return(fail("never reached winter site"))
+  arr   <- post[min(arr_i), ]
+
+  # the actual migration track (first row's step comes from before departure, so drop it)
+  m <- filter(d, dt >= dep$dt, dt <= arr$dt) %>% slice(-1)
+  if(nrow(m) < 2)                   return(fail("too few fixes in migration"))
+
+  dist_km  <- sum(m$step_km, na.rm = TRUE)
+  dur_d    <- as.numeric(difftime(arr$dt, dep$dt, units = "days"))
+  straight <- hav_km(dep$long, dep$lat, arr$long, arr$lat)
+
+  # in-flight speed from well-sampled steps only -> estimated flight hours
+  ok       <- m$step_h <= 1.5 & m$step_km >= 10
+  v_flight <- mean(m$speed[ok], na.rm = TRUE)
+
+  # travel days = days with > 50 km covered
+  travel_days <- m %>% mutate(day = as_date(dt)) %>%
+    group_by(day) %>% summarise(km = sum(step_km, na.rm = TRUE), .groups = "drop") %>%
+    filter(km > 50) %>% nrow()
+
+  tibble(yr = y, status = "complete",
+         dep_time = dep$dt, dep_lon = dep$long, dep_lat = dep$lat,
+         arr_time = arr$dt, arr_lon = arr$long, arr_lat = arr$lat,
+         summer_lon = s_lon, summer_lat = s_lat,
+         winter_lon = w_lon, winter_lat = w_lat,
+         dist_km = dist_km, straight_km = straight,
+         straightness = straight / dist_km,           # 1 = perfectly direct
+         duration_d = dur_d, travel_days = travel_days,
+         speed_km_d = dist_km / dur_d,                # overall pace incl. stopovers
+         km_per_travel_day = dist_km / travel_days,   # pace on days actually travelling
+         fly_hours = dist_km / v_flight,              # estimated hours in flight
+         max_gap_h = max(m$step_h, na.rm = TRUE),     # data-quality flag
+         n_fix = nrow(m))
+}
+
+mig <- trk %>%
+  group_by(ID_clean, route) %>%
+  group_modify(~ map_dfr(sort(unique(.x$yr)), \(y) mig_one(.x, y))) %>%
+  ungroup() %>%
+  group_by(ID_clean) %>%
+  mutate(first_year = yr == min(yr)) %>%     # first autumn of that bird (valid if tagged as nestling)
+  ungroup()
+
+# how many individual-years made it into the analysis, and why the others dropped out
+count(mig, status, sort = TRUE)
+
+mig_ok <- mig %>%
+  filter(status == "complete") %>%
+  mutate(dep_doy = yday(dep_time),
+         arr_doy = yday(arr_time),
+         route   = factor(route, levels = c("West", "East")))
+
+# sanity checks: very short routes or big data gaps deserve a look
+mig_ok %>% filter(max_gap_h > 72 | dist_km < 800) %>%
+  select(ID_clean, yr, route, dist_km, duration_d, max_gap_h)
+```
+
+### Population-level start and end of the route
+
+```{r}
+#| label: pop-start-end
+q <- \(x) quantile(x, c(.05, .5, .95), na.rm = TRUE)
+
+pop_sites <- mig_ok %>%
+  group_by(route) %>%
+  summarise(n_migrations = n(), n_individuals = n_distinct(ID_clean),
+            start_lon = median(dep_lon), start_lat = median(dep_lat),
+            end_lon   = median(arr_lon), end_lat   = median(arr_lat),
+            winter_lon_05 = q(winter_lon)[1], winter_lon_95 = q(winter_lon)[3],
+            winter_lat_05 = q(winter_lat)[1], winter_lat_95 = q(winter_lat)[3],
+            .groups = "drop")
+pop_sites
+write_csv(pop_sites, file.path(dir.out, "tables", "population_start_end.csv"))
+```
+
+```{r}
+#| label: map-start-end
+#| fig-width: 14
+#| fig-height: 9
+# migration tracks only (departure -> arrival) for complete migrations
+mig_tracks <- trk %>%
+  inner_join(select(mig_ok, ID_clean, mig_yr = yr, dep_time, arr_time),
+             join_by(ID_clean, between(dt, dep_time, arr_time))) %>%
+  mutate(route = factor(route, levels = c("West", "East")),
+         mig_id = paste(ID_clean, mig_yr))
+
+map.startend <- ggplot() +
+  geom_sf(data = world, fill = "grey60", col = "grey85", linewidth = .1) +
+  geom_path(data = mig_tracks, aes(x = long, y = lat, group = mig_id),
+            colour = "grey20", linewidth = .15, alpha = .35) +
+  geom_point(data = mig_ok, aes(x = dep_lon, y = dep_lat, colour = "Start"), size = 1, alpha = .6) +
+  geom_point(data = mig_ok, aes(x = arr_lon, y = arr_lat, colour = "End"),   size = 1, alpha = .6) +
+  geom_point(data = pop_sites, aes(x = start_lon, y = start_lat), shape = 21, size = 4, fill = "gold", stroke = 1) +
+  geom_point(data = pop_sites, aes(x = end_lon,   y = end_lat),   shape = 21, size = 4, fill = "red",  stroke = 1) +
+  scale_colour_manual("", values = c(Start = "gold", End = "red")) +
+  coord_sf(xlim = longlimits, ylim = latlimits, expand = FALSE) +
+  theme_classic() +
+  theme(panel.background = element_rect(fill = "grey85"),
+        strip.text = element_text(face = "bold"), legend.position = "bottom") +
+  xlab("") + ylab("") +
+  facet_wrap(~route, ncol = 2)
+map.startend
+
+# ggsave(file.path(dir.out, "maps", "Map_start-end_by_route.png"), map.startend,
+#        width = 30, height = 18, units = "cm", dpi = 300)
+```
+
+## 3. Distance and duration of each route
+
+```{r}
+#| label: distance-duration
+route_summary <- mig_ok %>%
+  group_by(route) %>%
+  summarise(n = n(), n_ind = n_distinct(ID_clean),
+            across(c(dist_km, duration_d, travel_days, fly_hours, speed_km_d, km_per_travel_day, straightness),
+                   list(median = median, q25 = ~quantile(.x, .25), q75 = ~quantile(.x, .75)),
+                   .names = "{.col}__{.fn}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(route, n, n_ind), names_to = c("metric", "stat"), names_sep = "__") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(c(median, q25, q75), \(x) round(x, 2)))
+route_summary
+write_csv(route_summary, file.path(dir.out, "tables", "route_summary.csv"))
+
+# boxplots
+box <- function(var, ylab){
+  ggplot(mig_ok, aes(route, .data[[var]], fill = route)) +
+    geom_boxplot(outlier.shape = NA, alpha = .5) +
+    geom_jitter(width = .12, size = 1, alpha = .5) +
+    scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+    theme_classic() + theme(legend.position = "none") + xlab("") + ylab(ylab)
+}
+(box("dist_km", "Distance (km)") | box("duration_d", "Duration (days)") |
+ box("fly_hours", "Estimated flight hours")) /
+(box("km_per_travel_day", "km per travelling day") | box("travel_days", "Travelling days") |
+ box("straightness", "Straightness (1 = direct)"))
+
+# tests: random intercept for individual because birds are measured in several years
+lmer(dist_km    ~ route + (1 | ID_clean), data = mig_ok) %>% summary()
+lmer(duration_d ~ route + (1 | ID_clean), data = mig_ok) %>% summary()
+```
+
+## 4. How often was each route taken?
+
+```{r}
+#| label: route-counts
+# individuals and migrations per route
+mig_ok %>% group_by(route) %>%
+  summarise(migrations = n(), individuals = n_distinct(ID_clean),
+            mean_migrations_per_bird = migrations / individuals)
+
+# per year
+route_year <- mig_ok %>% count(yr, route) %>%
+  complete(yr, route, fill = list(n = 0))
+route_year %>% pivot_wider(names_from = route, values_from = n)
+
+ggplot(route_year, aes(factor(yr), n, fill = route)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+  theme_classic() + xlab("Year") + ylab("Number of completed autumn migrations") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# do individuals stick to one route?
+mig_ok %>% group_by(ID_clean) %>%
+  summarise(n_routes = n_distinct(route), n_years = n()) %>%
+  count(n_routes, name = "individuals")
+```
+
+Because `route` was assigned per individual (your `west.ids` list), the last table will always show 1 route per bird. If you later classify routes per migration (e.g. by which strait is crossed), the same table tells you how many birds switch.
+
+## 5. Departure timing
+
+```{r}
+#| label: departure
+ref_date <- \(doy) as.Date(doy - 1, origin = "2001-01-01")   # one common year for plotting
+
+# (a) all years pooled
+ggplot(mig_ok, aes(ref_date(dep_doy), fill = route)) +
+  geom_density(alpha = .5, colour = NA) +
+  scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+  scale_x_date(date_labels = "%d %b") +
+  theme_classic() + xlab("Departure date") + ylab("Density")
+
+wilcox.test(dep_doy ~ route, data = mig_ok, exact = FALSE)
+
+# pooled model: year and individual as random effects, first-year birds usually leave differently
+m_dep <- lmer(dep_doy ~ route + first_year + (1 | yr) + (1 | ID_clean), data = mig_ok)
+summary(m_dep)
+
+# (b) within the same year
+ggplot(mig_ok, aes(route, ref_date(dep_doy), fill = route)) +
+  geom_boxplot(outlier.shape = NA, alpha = .5) +
+  geom_jitter(width = .12, size = 1) +
+  scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+  scale_y_date(date_labels = "%d %b") +
+  facet_wrap(~yr) +
+  theme_classic() + theme(legend.position = "none") + xlab("") + ylab("Departure date")
+
+within_year <- mig_ok %>%
+  group_by(yr) %>%
+  filter(all(table(route) >= 3)) %>%            # need >= 3 birds per route in that year
+  summarise(n_West = sum(route == "West"), n_East = sum(route == "East"),
+            med_West = median(dep_doy[route == "West"]),
+            med_East = median(dep_doy[route == "East"]),
+            diff_days_East_minus_West = med_East - med_West,
+            p_wilcox = wilcox.test(dep_doy ~ route, exact = FALSE)$p.value,
+            .groups = "drop")
+within_year
+
+# overall within-year effect: year as fixed effect, so only same-year comparisons count
+lmer(dep_doy ~ route + factor(yr) + (1 | ID_clean), data = mig_ok) %>% summary()
+```
+
+## 6. Which route is energetically cheaper?
+
+We have GPS/Argos only (no acceleration, so no ODBA), so energetics has to be inferred from proxies: distance, estimated flight hours (flapping/soaring flight costs scale with time aloft), how direct the route is, and how many days of travelling it takes.
+
+```{r}
+#| label: energetics
+cost <- mig_ok %>%
+  select(ID_clean, yr, route, first_year, dist_km, fly_hours, travel_days,
+         duration_d, straightness, km_per_travel_day)
+
+cost %>% group_by(route) %>%
+  summarise(across(c(dist_km, fly_hours, travel_days, duration_d, straightness),
+                   \(x) round(median(x), 2)))
+
+# model each proxy with the same structure
+cost_models <- c("dist_km", "fly_hours", "travel_days", "duration_d", "straightness") %>%
+  set_names() %>%
+  map(\(v) lmer(reformulate(c("route", "first_year", "(1 | ID_clean)"), response = v), data = cost))
+
+# route effect (East relative to West) for each proxy
+map_dfr(cost_models, \(m) as_tibble(coef(summary(m)), rownames = "term") %>%
+          filter(term == "routeEast"), .id = "proxy")
+```
+
+Caveat to keep in mind when writing it up: if a bird has a long data gap, `dist_km` is a minimum (straight line over the gap). `max_gap_h` in `mig_ok` lets you rerun everything on `filter(max_gap_h <= 48)` as a robustness check.
+
+## 7. Link with the wintering grounds
+
+Hypothesis: the route that costs more energy leads to better wintering grounds. Here the wintering site is the median position of each bird in mid-winter (`winter_lon/lat`). Climate comes from WorldClim (downloads once, then cached in `./output/env`). Annual and winter precipitation are crude proxies for food availability; swap in NDVI or cropland cover when you want something closer to stork habitat.
+
+```{r}
+#| label: winter-env
+dir.env <- file.path(dir.out, "env"); dir.create(dir.env, showWarnings = FALSE)
+
+prec <- worldclim_global(var = "prec", res = 10, path = dir.env)
+names(prec) <- month.abb
+prec_year   <- sum(prec)
+prec_winter <- sum(prec[[c("Dec", "Jan", "Feb")]])
+
+pts <- vect(select(mig_ok, winter_lon, winter_lat), geom = c("winter_lon", "winter_lat"), crs = "EPSG:4326")
+
+mig_env <- mig_ok %>%
+  mutate(prec_year   = terra::extract(prec_year,   pts)[, 2],
+         prec_winter = terra::extract(prec_winter, pts)[, 2])
+
+# winter range summary per route
+mig_env %>% group_by(route) %>%
+  summarise(median_lat = median(winter_lat), median_lon = median(winter_lon),
+            prec_year = median(prec_year, na.rm = TRUE),
+            prec_winter = median(prec_winter, na.rm = TRUE))
+
+(ggplot(mig_env, aes(route, prec_year, fill = route)) + geom_boxplot(alpha = .5) +
+   scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+   theme_classic() + theme(legend.position = "none") + xlab("") + ylab("Annual precipitation (mm)")) |
+(ggplot(mig_env, aes(route, prec_winter, fill = route)) + geom_boxplot(alpha = .5) +
+   scale_fill_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+   theme_classic() + theme(legend.position = "none") + xlab("") + ylab("Dec-Feb precipitation (mm)"))
+
+lmer(prec_year ~ route + (1 | ID_clean), data = mig_env) %>% summary()
+```
+
+### Cost versus benefit
+
+```{r}
+#| label: cost-benefit
+# crude "payoff" proxy: how long each bird was followed after the first migration
+# (confounded by tag failure, so treat with care)
+years_tracked <- trk %>% group_by(ID_clean) %>%
+  summarise(years_tracked = as.numeric(difftime(max(dt), min(dt), units = "days")) / 365.25)
+
+cb <- mig_env %>% left_join(years_tracked, by = "ID_clean")
+
+ggplot(cb, aes(fly_hours, prec_year, colour = route)) +
+  geom_point(alpha = .6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_manual(values = c(West = "#d95f02", East = "#1b9e77")) +
+  theme_classic() +
+  xlab("Cost: estimated flight hours") + ylab("Benefit: annual precipitation at wintering site (mm)")
+
+cb %>% distinct(ID_clean, route, years_tracked) %>%
+  group_by(route) %>% summarise(n = n(), median_years_tracked = median(years_tracked))
+```
