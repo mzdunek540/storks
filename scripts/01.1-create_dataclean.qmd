@@ -371,3 +371,4 @@ data <- data %>%
 
 colSums(is.na(st_drop_geometry(data)[, c("alt_gps", "alt_argos")]))
 ```
+

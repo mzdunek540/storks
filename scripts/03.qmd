@@ -1,0 +1,128 @@
+## Investigate track length and number of fixes per deployment
+
+```{r}
+#| label: investigate-tracks
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+
+lc_keep <- c("3", "2", "1", "0", "A")   # same classes as in step 2.4
+src     <- tracks                       # use `data` here if you run this after PART 2
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  rad <- pi / 180
+  a <- sin((lat2 - lat1) * rad / 2)^2 +
+       cos(lat1 * rad) * cos(lat2 * rad) * sin((lon2 - lon1) * rad / 2)^2
+  2 * 6371 * asin(pmin(1, sqrt(a)))
+}
+max_or_na <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+
+# ---- Fixes ------------------------------------------------------------
+fixes <- src |>
+  as_tibble() |>
+  select(deployment_id, sensor_type_id, timestamp, long, lat, argos_lc) |>
+  filter(!is.na(long), !is.na(lat), !is.na(timestamp)) |>
+  distinct(deployment_id, timestamp, .keep_all = TRUE) |>
+  mutate(good = is.na(argos_lc) | as.character(argos_lc) %in% lc_keep) |>
+  arrange(deployment_id, timestamp)
+
+n_all <- count(fixes, deployment_id, name = "n_all")   # before quality filter
+
+# ---- Statistics per deployment (usable fixes only) --------------------
+track_stats <- fixes |>
+  filter(good) |>
+  group_by(deployment_id) |>
+  mutate(step_km  = haversine_km(lag(long), lag(lat), long, lat),
+         step_h   = as.numeric(difftime(timestamp, lag(timestamp), units = "hours")),
+         speed_kmh = step_km / step_h) |>
+  summarise(
+    n_fixes       = n(),
+    n_gps         = sum(sensor_type_id == 653),
+    n_argos       = sum(sensor_type_id != 653),
+    first_fix     = min(timestamp),
+    last_fix      = max(timestamp),
+    duration_days = as.numeric(difftime(last_fix, first_fix, units = "days")),
+    fixes_per_day = n_fixes / pmax(duration_days, 1),
+    median_gap_h  = median(step_h, na.rm = TRUE),
+    max_gap_days  = max_or_na(step_h) / 24,
+    path_km       = sum(step_km, na.rm = TRUE),
+    max_dist_from_start_km = max(haversine_km(first(long), first(lat), long, lat)),
+    max_step_km   = max_or_na(step_km),
+    max_speed_kmh = max_or_na(speed_kmh[is.finite(speed_kmh)]),
+    .groups = "drop"
+  )
+
+# All deployments in meta, also those without usable fixes
+stats <- meta |>
+  as_tibble() |>
+  select(deployment_id, individual_id, age = animal_life_stage) |>
+  left_join(n_all, by = "deployment_id") |>
+  left_join(track_stats, by = "deployment_id") |>
+  mutate(across(c(n_all, n_fixes, n_gps, n_argos), ~ replace_na(.x, 0)))
+
+# ---- 1. Overview ------------------------------------------------------
+stats |>
+  summarise(across(c(n_all, n_fixes, duration_days, fixes_per_day,
+                     max_gap_days, path_km, max_step_km, max_speed_kmh),
+                   list(min = ~ min(.x, na.rm = TRUE),
+                        median = ~ median(.x, na.rm = TRUE),
+                        max = ~ max(.x, na.rm = TRUE)))) |>
+  pivot_longer(everything(), names_to = c("variable", ".value"),
+               names_pattern = "(.*)_(min|median|max)")
+
+# The 25 deployments with the fewest usable fixes
+stats |>
+  arrange(n_fixes) |>
+  select(deployment_id, individual_id, n_all, n_fixes, n_gps, n_argos,
+         duration_days, max_gap_days, path_km, max_speed_kmh) |>
+  head(25) |>
+  print(n = 25)
+
+# ---- 2. How many deployments / fixes are kept at each threshold? ------
+map_dfr(c(1, 5, 10, 20, 30, 50, 100, 200), \(t)
+  tibble(min_fixes = t,
+         deployments_kept = sum(stats$n_fixes >= t),
+         fixes_kept       = sum(stats$n_fixes[stats$n_fixes >= t])))
+
+map_dfr(c(0, 1, 3, 7, 14, 30, 60, 90), \(t)
+  tibble(min_duration_days = t,
+         deployments_kept = sum(stats$duration_days >= t, na.rm = TRUE)))
+
+# ---- 3. Plots ---------------------------------------------------------
+stats |>
+  filter(n_fixes > 0) |>
+  ggplot(aes(n_fixes)) +
+  geom_histogram(bins = 40) +
+  scale_x_log10() +
+  labs(x = "Usable fixes per deployment (log scale)", y = "Deployments") +
+  theme_classic()
+
+stats |>
+  filter(n_fixes > 0) |>
+  ggplot(aes(duration_days + 1, n_fixes, colour = max_gap_days)) +
+  geom_point(alpha = 0.7) +
+  scale_x_log10() + scale_y_log10() +
+  scale_colour_viridis_c(trans = "log10", name = "Longest gap (days)") +
+  labs(x = "Duration + 1 (days, log scale)", y = "Usable fixes (log scale)") +
+  theme_classic()
+
+# ---- 4. Map: do the short tracks really jump? -------------------------
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+path_data <- fixes |>
+  filter(good) |>
+  left_join(select(stats, deployment_id, n_fixes), by = "deployment_id") |>
+  mutate(size_class = cut(n_fixes, c(-Inf, 10, 50, 200, Inf),
+                          labels = c("10 or fewer", "11-50", "51-200", "more than 200")))
+
+ggplot() +
+  geom_sf(data = world, fill = "grey95", colour = "grey70", linewidth = 0.1) +
+  geom_path(data = path_data, aes(long, lat, group = deployment_id),
+            alpha = 0.4, linewidth = 0.3) +
+  geom_point(data = path_data, aes(long, lat), size = 0.2, alpha = 0.5) +
+  facet_wrap(~ size_class) +
+  coord_sf(xlim = range(path_data$long) + c(-2, 2),
+           ylim = range(path_data$lat)  + c(-2, 2), expand = FALSE) +
+  labs(x = NULL, y = NULL, title = "Tracks by number of usable fixes") +
+  theme_minimal()
+```
